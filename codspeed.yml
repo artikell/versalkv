@@ -1,0 +1,10 @@
+$schema: https://raw.githubusercontent.com/CodSpeedHQ/codspeed/refs/heads/main/schemas/codspeed.schema.json
+
+# The entrypoint reports 14 workloads with one iteration per completed request.
+# Min/max/mean are computed across per-round request costs in nanoseconds.
+# Server startup and dataset preparation run before the CodSpeed action.
+benchmarks:
+  - name: valkey-benchmark
+    entrypoint: >-
+      python3 scripts/versal-util.py ci codspeed measure
+      --requests 500000 --rounds 3 --warmup-sec 1
