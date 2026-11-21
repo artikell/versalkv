@@ -163,7 +163,7 @@ pub(crate) struct ServerWorkerState {
     /// flush, and prevents client-side-caching invalidation traffic from
     /// compounding into an eviction feedback loop.
     pub(in crate::runtime::server) command_eviction_ran_this_turn: bool,
-    pub(crate) priority_subnets_generation: u64,
+    pub(crate) priority_connections: usize,
     pub(crate) priority_command_token: Option<Token>,
     pub(crate) priority_command_is_nested: bool,
     pub(crate) command_execution_depth: usize,
@@ -266,13 +266,26 @@ impl ServerWorkerState {
         ))
     }
 
-    fn new_with_context(ctx: ServerContext) -> std::io::Result<Self> {
+    fn new_with_context(mut ctx: ServerContext) -> std::io::Result<Self> {
+        ctx.module_registry_mut()
+            .ensure_thread_bridge()
+            .map_err(std::io::Error::other)?;
         let mut transport = RuntimeTransport::new(ProductionTransport::new()?);
         let (io_wake_token, io_wake) = transport.register_thread_waker()?;
         let mut runtime_sources = RuntimeSourceRegistry::default();
         if let Err(error) = runtime_sources.install(io_wake_token, SourceOwner::IoWorkerWake) {
             let cleanup = transport.remove_registered(io_wake_token);
             return Err(source_install_error(error, cleanup.err()));
+        }
+        let (module_wake_token, module_wake) = transport.register_thread_waker()?;
+        if let Err(error) =
+            runtime_sources.install(module_wake_token, SourceOwner::ModuleThreadWake)
+        {
+            let cleanup = transport.remove_registered(module_wake_token);
+            return Err(source_install_error(error, cleanup.err()));
+        }
+        if let Some(bridge) = &ctx.module_registry().thread_bridge {
+            bridge.install_waker(module_wake);
         }
         let worker_completions = WorkerCompletionQueue::new(io_wake.clone());
         let worker_completion_sender = worker_completions.sender();
@@ -346,7 +359,7 @@ impl ServerWorkerState {
             event_loop_cycle_start: None,
             cycle_time_guard: None,
             command_eviction_ran_this_turn: false,
-            priority_subnets_generation: 0,
+            priority_connections: 0,
             priority_command_token: None,
             priority_command_is_nested: false,
             command_execution_depth: 0,
@@ -668,6 +681,13 @@ impl ServerWorkerState {
         {
             return false;
         }
+        if self
+            .replication_runtime
+            .replica_link()
+            .is_some_and(|link| link.primary_connection_error().is_some())
+        {
+            return false;
+        }
         let Some(connection_token) = self
             .connection_registry
             .contains(crate::framework::capabilities::io::Token(main.0))
@@ -832,6 +852,7 @@ fn source_install_error(
 
 impl Drop for ServerWorkerState {
     fn drop(&mut self) {
+        self.close_module_thread_bridge();
         if let Some(write) = self.child_signal_write.take() {
             crate::foundation::io::sys::signal::clear_child_signal_wake(write.as_raw_fd());
         }

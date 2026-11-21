@@ -262,6 +262,10 @@ impl ServerWorkerState {
             SourceOwner::IoWorkerWake => {
                 self.dispatch_control_now(super::ControlEvent::IoWorkerWake);
             }
+            SourceOwner::ModuleThreadWake => {
+                self.close_module_thread_bridge();
+                self.ctx.set_shutdown_requested(true);
+            }
             SourceOwner::InternalPipe(_) => self.retire_failed_internal_source(token, "readiness"),
             // Later tasks install these source classes together with their
             // concrete teardown state machines.
@@ -299,6 +303,19 @@ impl ServerWorkerState {
             .filter(|link| link.connection_id().0 == token.0)?;
         self.replication_runtime
             .channel_pair_for(ConnectionId(token.0))
+    }
+
+    /// C removes the primary read handler while buffering reaches the limit, so
+    /// a HUP arriving during the paced RDB load must not tear the link down
+    /// immediately. Adjudication is deferred to the streaming liveness check
+    /// once the buffered replay starts (upstream #5417).
+    fn paused_loading_dual_main_ignores_hup(&self, token: Token) -> bool {
+        self.ctx.is_loading()
+            && self.replication_runtime.replica_main_read_paused()
+            && self
+                .replication_runtime
+                .replica_link()
+                .is_some_and(|link| link.connection_id().0 == token.0)
     }
 
     #[cfg(test)]
@@ -519,6 +536,15 @@ impl ServerWorkerState {
         let Some(route) = self.runtime_sources.resolve_token(token).cloned() else {
             return TransportEventDispatchOutcome::stale();
         };
+        if matches!(route.owner, SourceOwner::Connection)
+            && (ready.read_hup || ready.error)
+            && self.defer_paused_dual_main_failure(
+                token,
+                "primary transport reported closed readiness".to_string(),
+            )
+        {
+            return TransportEventDispatchOutcome::deferred();
+        }
         if ready.is_writable() {
             self.writes.clear_replica_writable_wait(token);
             self.cancel_runtime_runnable(RunnableKey::ClientWrite(token));
@@ -982,6 +1008,7 @@ impl ServerWorkerState {
         {
             Some(
                 SourceOwner::IoWorkerWake
+                | SourceOwner::ModuleThreadWake
                 | SourceOwner::ControlWake
                 | SourceOwner::ChildSignal(_)
                 | SourceOwner::ClusterBus,
@@ -1014,6 +1041,9 @@ impl ServerWorkerState {
                 self.dispatch_control_now(super::ControlEvent::IoWorkerWake);
                 TransportEventDispatchOutcome::handled()
             }
+            // The transport drained this waker. Nested dispatch must never
+            // grant a lease while its outer synchronous invocation is live.
+            SourceOwner::ModuleThreadWake => TransportEventDispatchOutcome::handled(),
             SourceOwner::Listener => self.dispatch_listener_readiness(ready),
             SourceOwner::Connection => {
                 self.dispatch_connection_readiness(ready.token, ready, flush_after_readable)
@@ -1104,6 +1134,8 @@ impl ServerWorkerState {
         let route = {
             use ConnectionReadinessRoute::*;
             if ready.is_readable()
+                && !ready.has_readable_hup()
+                && !ready.error
                 && self
                     .pending_replication_replay
                     .as_ref()
@@ -1112,7 +1144,9 @@ impl ServerWorkerState {
                 DeferRdbReplay
             } else if ready.is_readable() && self.is_slot_export_read_intercept(token.0) {
                 SlotExportIntercept
-            } else if ready.has_readable_hup() && self.replica_rdb_main_for_failure(token).is_some()
+            } else if ready.has_readable_hup()
+                && self.replica_rdb_main_for_failure(token).is_some()
+                && !self.paused_loading_dual_main_ignores_hup(token)
             {
                 RdbMainHup
             } else if ready.has_readable_hup()
@@ -1333,7 +1367,10 @@ impl ServerWorkerState {
         let owner_closed =
             self.is_pending_transport_removal(token) || !self.transport.is_registered(token);
         let outcome = match owner {
-            SourceOwner::IoWorkerWake | SourceOwner::ControlWake | SourceOwner::ChildSignal(_)
+            SourceOwner::IoWorkerWake
+            | SourceOwner::ModuleThreadWake
+            | SourceOwner::ControlWake
+            | SourceOwner::ChildSignal(_)
                 if owner_closed =>
             {
                 DispatchOutcome::Handled

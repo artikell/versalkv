@@ -28,6 +28,66 @@ struct ObserverCompletion<'a> {
     connection_effects: Option<&'a ConnectionCommandEffects>,
 }
 
+#[cfg(test)]
+mod read_tracking_tests {
+    use super::*;
+    use crate::engine::command::CommandArgs;
+    use crate::framework::capabilities::connection::Connection;
+    use crate::framework::capabilities::io::Token;
+    use crate::runtime::server::worker::command::invocation::CommandTarget;
+
+    #[test]
+    fn readonly_script_completion_tracks_only_nested_reads() {
+        for name in ["eval_ro", "evalsha_ro", "fcall_ro"] {
+            let mut runtime = ServerWorkerState::new(1).unwrap();
+            crate::framework::commands::register_all(&mut runtime.registry);
+            let token = Token(42);
+            let mut connection = Connection::new_fake();
+            connection.set_token_for_test(token);
+            connection.set_tracking(true);
+            runtime.connection_registry.insert(connection);
+            runtime.ctx.tracking_mut().clients.insert(token.0);
+            let nested_key = Bytes::from_static(b"nested-read");
+            runtime
+                .ctx
+                .tracking_mut()
+                .remember_key(token.0, &nested_key);
+            let args = CommandArgs::from_parts(vec![
+                Bytes::copy_from_slice(name.as_bytes()),
+                Bytes::from_static(b"script-or-function"),
+                Bytes::from_static(b"2"),
+                Bytes::from_static(b"declared-only"),
+                nested_key.clone(),
+            ]);
+            let spec = runtime.registry.lookup(name.as_bytes()).unwrap();
+            let invocation = CommandInvocation::direct(
+                CommandTarget::new(token),
+                &args,
+                name,
+                spec.flags,
+                spec.dispatch_group,
+                &[],
+            );
+
+            runtime.capture_read_tracking(invocation, CommandExecutionStatus::Executed, token.0);
+
+            assert!(
+                runtime
+                    .ctx
+                    .tracking_mut()
+                    .take_clients_for_key(&Bytes::from_static(b"declared-only"))
+                    .is_empty(),
+                "{name} must not track keys merely declared by its caller"
+            );
+            assert_eq!(
+                runtime.ctx.tracking_mut().take_clients_for_key(&nested_key),
+                vec![token.0],
+                "nested reads must remain tracked after {name} completes"
+            );
+        }
+    }
+}
+
 impl ServerWorkerState {
     pub(super) fn complete_command(
         &mut self,
@@ -211,7 +271,26 @@ impl ServerWorkerState {
                 stat.usec = stat.usec.saturating_sub(duration_us);
             }
         }
+        self.commit_native_module_initial_effects(connection_token, Some(effects));
         self.commit_blocked_stream_read_effects(connection_token, None, None, Some(effects));
+        if !was_blocked_before {
+            if let Some(crate::engine::command::context::BlockedState {
+                cmd: BlockedCmd::Module { id },
+                ..
+            }) = self.connection_registry
+                [crate::framework::capabilities::io::Token(connection_token)]
+            .blocked
+            .as_ref()
+            {
+                if let Some(record) = self.ctx.module_registry_mut().native_blocks.get_mut(id) {
+                    record.active_time_usec = duration_us;
+                    crate::engine::extension::module::thread_bridge::lock(
+                        &record.shared.lifecycle,
+                    )
+                    .stage = crate::engine::extension::module::blocking::ModuleBlockStage::Armed;
+                }
+            }
+        }
         let request_wait_ack = self.register_blocked_command(connection_token);
         let monitor = (!was_blocked_before).then(|| {
             let connection = &self.connection_registry
@@ -262,6 +341,10 @@ impl ServerWorkerState {
                 self.ctx
                     .blocking_registry_mut()
                     .register_keyless_client(connection.session_id());
+                false
+            }
+            BlockedCmd::Module { .. } => {
+                self.ctx.blocking_registry_mut().register_keyless_client(connection.session_id());
                 false
             }
             BlockedCmd::Paused
@@ -414,7 +497,12 @@ impl ServerWorkerState {
         status: CommandExecutionStatus,
         connection_token: usize,
     ) {
-        if status.is_rejected() || invocation.flags & CMD_READONLY == 0 {
+        // Script wrappers declare keys for routing. Their nested commands
+        // record the actual reads, as in C call(), so do not track declarations.
+        if status.is_rejected()
+            || invocation.flags & CMD_READONLY == 0
+            || matches!(invocation.name, "eval_ro" | "evalsha_ro" | "fcall_ro")
+        {
             return;
         }
         let connection = &mut self.connection_registry

@@ -32,6 +32,11 @@ pub(crate) fn with_legacy_host_dispatcher<R>(
                     "AOF command reached the legacy Lua dispatcher",
                 ))
             }
+            crate::engine::host::HostCommandOrigin::RdbReplay { .. } => {
+                Err(crate::engine::host::HostError::Invariant(
+                    "RDB command reached the legacy Lua dispatcher",
+                ))
+            }
         },
         crate::engine::host::HostRequest::CheckAcl { args } => {
             check_acl_command(conn, runtime, args)
@@ -48,6 +53,11 @@ pub(crate) fn with_legacy_host_dispatcher<R>(
             super::timeout::on_script_timeout_tick(run, runtime);
             Ok(crate::engine::host::HostReply::Continue)
         }
+        crate::engine::host::HostRequest::Yield(
+            crate::engine::host::HostYield::ScriptDebugStop { .. },
+        ) => Err(crate::engine::host::HostError::Invariant(
+            "debugger stop reached the legacy Lua dispatcher",
+        )),
         crate::engine::host::HostRequest::Yield(
             crate::engine::host::HostYield::RdbProgress { .. }
             | crate::engine::host::HostYield::Module { .. }
@@ -1037,7 +1047,9 @@ pub(crate) fn execute_script_command(
         return error;
     }
     let outcome = run_script_command(&invocation, script_ctx, conn, runtime, stats_name);
-    commit_script_outcome(&invocation, outcome, script_ctx, conn, runtime)
+    let result = commit_script_outcome(&invocation, outcome, script_ctx, conn, runtime);
+    runtime.finish_script_command(conn, script_ctx);
+    result
 }
 
 #[cfg(test)]

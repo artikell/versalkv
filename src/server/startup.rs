@@ -142,6 +142,12 @@ impl Server {
         backend.ctx.set_startup_args(self.startup_args.clone());
         self.normalize_paths(&mut backend);
         self.apply_config(&mut backend);
+        if self.config.sentinel {
+            crate::foundation::io::sys::sentinel_config::probe_config_save(Path::new(
+                &self.config.config_file,
+            ))
+            .inspect_err(|error| crate::server_log!(warning, "{error}"))?;
+        }
         crate::foundation::io::sys::log::set_debug_context(
             backend.ctx.config().server.debug_context.clone(),
         );
@@ -439,11 +445,12 @@ impl Server {
         metadata: crate::foundation::io::persistence::RdbDecodedMetadata,
         load_role: crate::engine::distributed::replication::ReplicationRole,
     ) {
-        if crate::framework::host_tasks::replace_function_libraries(
-            &mut backend.ctx,
-            &metadata.function_codes,
-        )
-        .is_err()
+        if !metadata.functions_applied
+            && crate::framework::host_tasks::replace_function_libraries(
+                &mut backend.ctx,
+                &metadata.function_codes,
+            )
+            .is_err()
         {
             self.exit_after_rdb_task_error(crate::framework::host_tasks::RdbTaskError::Load(
                 crate::foundation::io::persistence::LoadError::Corrupt,

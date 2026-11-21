@@ -73,6 +73,14 @@ fn module_doc(ctx: &ServerContext, command_name: &str, module_name: &str) -> Val
             Value::bulk(Bytes::copy_from_slice(module_name.as_bytes())),
         ),
     ];
+    if let Some(arguments) = ctx
+        .module_registry()
+        .lookup_cmd_func(command_name)
+        .and_then(|entry| entry.arguments.as_ref())
+        .filter(|arguments| !arguments.is_empty())
+    {
+        fields.push((bulk("arguments"), module_argument_docs(arguments)));
+    }
     let subcommands: Vec<_> = ctx
         .module_registry()
         .subcommand_names(command_name)
@@ -96,6 +104,65 @@ fn module_doc(ctx: &ServerContext, command_name: &str, module_name: &str) -> Val
     Value::Map(fields)
 }
 
+fn module_argument_docs(
+    arguments: &[crate::engine::extension::module::api::command_args::ModuleCommandArg],
+) -> Value {
+    Value::Array(
+        arguments
+            .iter()
+            .map(|argument| {
+                let mut fields = vec![
+                    (bulk("name"), Value::bulk(argument.name.clone())),
+                    (bulk("type"), bulk(argument.arg_type)),
+                ];
+                let is_container = matches!(argument.arg_type, "oneof" | "block");
+                if !is_container {
+                    fields.push((
+                        bulk("display_text"),
+                        Value::bulk(
+                            argument.display_text.as_ref().unwrap_or(&argument.name).clone(),
+                        ),
+                    ));
+                }
+                if let Some(index) = argument.key_spec_index {
+                    fields.push((bulk("key_spec_index"), Value::integer(i64::from(index))));
+                }
+                for (name, value) in [
+                    ("token", argument.token.as_ref()),
+                    ("summary", argument.summary.as_ref()),
+                    ("since", argument.since.as_ref()),
+                    ("deprecated_since", argument.deprecated_since.as_ref()),
+                ] {
+                    if let Some(value) = value {
+                        fields.push((bulk(name), Value::bulk(value.clone())));
+                    }
+                }
+                if !argument.flags.is_empty() {
+                    fields.push((
+                        bulk("flags"),
+                        Value::set(
+                            argument
+                                .flags
+                                .iter()
+                                .map(|flag| {
+                                    Value::SimpleString(Bytes::from_static(flag.as_bytes()))
+                                })
+                                .collect(),
+                        ),
+                    ));
+                }
+                if is_container {
+                    fields.push((
+                        bulk("arguments"),
+                        module_argument_docs(&argument.arguments),
+                    ));
+                }
+                Value::Map(fields)
+            })
+            .collect(),
+    )
+}
+
 fn bulk(value: &'static str) -> Value {
     Value::bulk(Bytes::from_static(value.as_bytes()))
 }
@@ -104,6 +171,403 @@ fn bulk(value: &'static str) -> Value {
 mod tests {
     use super::*;
     use crate::engine::extension::module::{ModuleCommandInfo, ModuleRef};
+
+    fn field<'a>(value: &'a Value, name: &'static str) -> Option<&'a Value> {
+        let Value::Map(fields) = value else {
+            panic!("expected a documentation map, got {value:?}");
+        };
+        fields
+            .iter()
+            .find(|(key, _)| key == &bulk(name))
+            .map(|(_, value)| value)
+    }
+
+    fn arguments(value: &Value) -> &[Value] {
+        let Some(Value::Array(arguments)) = field(value, "arguments") else {
+            panic!("expected a documentation argument array, got {value:?}");
+        };
+        arguments
+    }
+
+    fn builtin_command_doc(name: &'static str) -> Value {
+        let mut registry = CommandRegistry::new();
+        crate::framework::commands::register_all(&mut registry);
+        let reply = command_docs(
+            &registry,
+            &ServerContext::new(1),
+            &[Bytes::from_static(name.as_bytes())],
+        );
+        field(&reply, name).unwrap().clone()
+    }
+
+    fn optional_flags() -> Value {
+        Value::set(vec![Value::SimpleString(Bytes::from_static(b"optional"))])
+    }
+
+    #[test]
+    fn builtin_docs_preserve_sorted_set_double_arguments_in_source_order() {
+        for (name, index, argument_name) in [
+            ("zincrby", 1, "increment"),
+            ("zinter", 2, "weight"),
+            ("zinterstore", 3, "weight"),
+            ("zunion", 2, "weight"),
+            ("zunionstore", 3, "weight"),
+        ] {
+            let doc = builtin_command_doc(name);
+            let argument = &arguments(&doc)[index];
+            assert_eq!(field(argument, "name"), Some(&bulk(argument_name)));
+            assert_eq!(field(argument, "type"), Some(&bulk("double")));
+            assert_eq!(field(argument, "display_text"), Some(&bulk(argument_name)));
+            assert_eq!(field(argument, "arguments"), None);
+            if argument_name == "weight" {
+                assert_eq!(field(argument, "token"), Some(&bulk("WEIGHTS")));
+                assert_eq!(
+                    field(argument, "flags"),
+                    Some(&Value::set(vec![
+                        Value::SimpleString(Bytes::from_static(b"optional")),
+                        Value::SimpleString(Bytes::from_static(b"multiple")),
+                    ]))
+                );
+            } else {
+                assert_eq!(field(argument, "flags"), None);
+            }
+        }
+        let doc = builtin_command_doc("zinterstore");
+        assert_eq!(
+            field(&arguments(&doc)[0], "name"),
+            Some(&bulk("destination"))
+        );
+        assert_eq!(
+            field(&arguments(&doc)[0], "key_spec_index"),
+            Some(&Value::integer(0))
+        );
+        assert_eq!(
+            field(&arguments(&doc)[2], "key_spec_index"),
+            Some(&Value::integer(1))
+        );
+    }
+
+    #[test]
+    fn builtin_docs_preserve_nested_expiry_and_zadd_conditions() {
+        for (name, index) in [
+            ("expire", 2),
+            ("expireat", 2),
+            ("pexpire", 2),
+            ("pexpireat", 2),
+            ("hexpire", 2),
+            ("hexpireat", 2),
+            ("hpexpire", 2),
+            ("hpexpireat", 2),
+            ("zadd", 1),
+        ] {
+            let doc = builtin_command_doc(name);
+            let condition = &arguments(&doc)[index];
+            assert_eq!(field(condition, "type"), Some(&bulk("oneof")));
+            assert_eq!(field(condition, "flags"), Some(&optional_flags()));
+            assert_eq!(field(condition, "display_text"), None);
+            let alternatives = arguments(condition);
+            assert_eq!(field(&alternatives[0], "token"), Some(&bulk("NX")));
+            let xx_comparison = &alternatives[1];
+            assert_eq!(field(xx_comparison, "type"), Some(&bulk("block")));
+            assert_eq!(field(xx_comparison, "display_text"), None);
+            let options = arguments(xx_comparison);
+            assert_eq!(field(&options[0], "token"), Some(&bulk("XX")));
+            assert_eq!(field(&options[0], "flags"), Some(&optional_flags()));
+            let comparison = &options[1];
+            assert_eq!(field(comparison, "flags"), Some(&optional_flags()));
+            let comparisons = arguments(comparison);
+            assert_eq!(comparisons.len(), 2);
+            for (option, token) in comparisons.iter().zip(["GT", "LT"]) {
+                assert_eq!(field(option, "type"), Some(&bulk("pure-token")));
+                assert_eq!(field(option, "token"), Some(&bulk(token)));
+                assert_eq!(field(option, "flags"), None);
+            }
+        }
+        for name in ["expireat", "pexpireat", "hexpireat", "hpexpireat"] {
+            let doc = builtin_command_doc(name);
+            assert_eq!(field(&arguments(&doc)[1], "type"), Some(&bulk("unix-time")));
+        }
+    }
+
+    #[test]
+    fn builtin_docs_preserve_mutually_exclusive_argument_blocks() {
+        for (name, index, tokens, kind) in [
+            ("restore", 5, ["IDLETIME", "FREQ"], "integer"),
+            ("restore-asking", 5, ["IDLETIME", "FREQ"], "integer"),
+            ("lcs", 2, ["LEN", "IDX"], "pure-token"),
+        ] {
+            let doc = builtin_command_doc(name);
+            let selector = &arguments(&doc)[index];
+            assert_eq!(field(selector, "type"), Some(&bulk("oneof")));
+            assert_eq!(field(selector, "flags"), Some(&optional_flags()));
+            assert_eq!(arguments(selector).len(), 2);
+            for (option, token) in arguments(selector).iter().zip(tokens) {
+                assert_eq!(field(option, "type"), Some(&bulk(kind)));
+                assert_eq!(field(option, "token"), Some(&bulk(token)));
+                assert_eq!(field(option, "flags"), None);
+            }
+        }
+    }
+
+    #[test]
+    fn builtin_docs_preserve_leaf_metadata_and_normalize_string_aliases() {
+        let doc = builtin_command_doc("cluster|setslot");
+        let importing = &arguments(&arguments(&doc)[1])[0];
+        assert_eq!(field(importing, "name"), Some(&bulk("importing")));
+        assert_eq!(field(importing, "display_text"), Some(&bulk("node-id")));
+        assert_eq!(field(importing, "token"), Some(&bulk("IMPORTING")));
+        assert_eq!(field(&arguments(&doc)[2], "since"), Some(&bulk("8.0.0")));
+
+        let doc = builtin_command_doc("client|kill");
+        let old_format = &arguments(&arguments(&doc)[0])[0];
+        assert_eq!(field(old_format, "display_text"), Some(&bulk("ip:port")));
+        assert_eq!(field(old_format, "deprecated_since"), Some(&bulk("2.8.12")));
+        let new_format = &arguments(&arguments(&doc)[0])[1];
+        let client_type = &arguments(new_format)[1];
+        assert_eq!(
+            field(&arguments(client_type)[0], "token"),
+            Some(&bulk("NORMAL"))
+        );
+
+        let doc = builtin_command_doc("set");
+        let comparison = &arguments(&arguments(&doc)[2])[2];
+        assert_eq!(field(comparison, "since"), Some(&bulk("8.1.0")));
+        assert_eq!(
+            field(comparison, "summary"),
+            Some(&bulk("Sets the key's value only if the current value matches the specified comparison value."))
+        );
+
+        for (name, index) in [("hincrby", 1), ("zincrby", 2)] {
+            let doc = builtin_command_doc(name);
+            assert_eq!(
+                field(&arguments(&doc)[index], "type"),
+                Some(&bulk("string"))
+            );
+        }
+        let doc = builtin_command_doc("xread");
+        let id = &arguments(&arguments(&doc)[2])[1];
+        assert_eq!(field(id, "name"), Some(&bulk("id")));
+        assert_eq!(field(id, "display_text"), Some(&bulk("id")));
+
+        let doc = builtin_command_doc("hexpire");
+        let fields = arguments(arguments(&doc).last().unwrap());
+        assert_eq!(field(&fields[0], "name"), Some(&bulk("numfields")));
+        assert_eq!(field(&fields[0], "flags"), None);
+        assert_eq!(
+            field(&fields[1], "flags"),
+            Some(&Value::set(vec![Value::SimpleString(Bytes::from_static(
+                b"multiple"
+            ))]))
+        );
+    }
+
+    #[test]
+    fn builtin_docs_render_repeated_token_flags_as_resp_sets() {
+        let doc = builtin_command_doc("sort");
+        let get = arguments(&doc)
+            .iter()
+            .find(|argument| field(argument, "token") == Some(&bulk("GET")))
+            .unwrap();
+        let flags = field(get, "flags").unwrap();
+        assert_eq!(
+            flags,
+            &Value::set(vec![
+                Value::SimpleString(Bytes::from_static(b"optional")),
+                Value::SimpleString(Bytes::from_static(b"multiple")),
+                Value::SimpleString(Bytes::from_static(b"multiple_token")),
+            ])
+        );
+        use crate::foundation::io::protocol::serializer::{
+            serialize_to_vec_resp2, serialize_to_vec_resp3,
+        };
+        assert_eq!(
+            serialize_to_vec_resp2(flags),
+            b"*3\r\n+optional\r\n+multiple\r\n+multiple_token\r\n"
+        );
+        assert_eq!(
+            serialize_to_vec_resp3(flags),
+            b"~3\r\n+optional\r\n+multiple\r\n+multiple_token\r\n"
+        );
+    }
+
+    #[test]
+    fn builtin_docs_preserve_upstream_string_repetition_flags() {
+        use crate::foundation::io::protocol::serializer::{
+            serialize_to_vec_resp2, serialize_to_vec_resp3,
+        };
+
+        let doc = builtin_command_doc("client|capa");
+        let flags = field(&arguments(&doc)[0], "flags").expect("repeated capability argument");
+        assert_eq!(
+            flags,
+            &Value::set(vec![Value::SimpleString(Bytes::from_static(b"multiple"))])
+        );
+        assert_eq!(serialize_to_vec_resp2(flags), b"*1\r\n+multiple\r\n");
+        assert_eq!(serialize_to_vec_resp3(flags), b"~1\r\n+multiple\r\n");
+    }
+
+    #[test]
+    fn builtin_docs_omit_arguments_for_commands_without_parameters() {
+        let doc = builtin_command_doc("dbsize");
+        assert_eq!(field(&doc, "arguments"), None);
+        assert_eq!(field(&doc, "group"), Some(&bulk("server")));
+    }
+
+    #[test]
+    fn portable_docs_share_generated_argument_rendering() {
+        use crate::framework::commands::introspection::CommandCatalog;
+        use crate::framework::commands::server::command::static_catalog::STATIC_COMMAND_CATALOG;
+
+        for name in ["zincrby", "expire", "zadd", "object|encoding"] {
+            let reply = STATIC_COMMAND_CATALOG.docs(&[Bytes::from_static(name.as_bytes())]);
+            assert_eq!(field(&reply, name), Some(&builtin_command_doc(name)));
+        }
+        assert_eq!(
+            STATIC_COMMAND_CATALOG.docs(&[Bytes::from_static(b"cluster|setslot")]),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn command_metadata_docs_preserve_binary_argument_fields() {
+        use crate::engine::extension::module::api::command_args::test_support::copied_binary_tree;
+        use crate::foundation::io::protocol::serializer::{
+            serialize_to_vec_resp2, serialize_to_vec_resp3,
+        };
+
+        fn binary(value: &'static [u8]) -> Value {
+            Value::bulk(Bytes::from_static(value))
+        }
+
+        let copied = copied_binary_tree();
+        let rendered = module_argument_docs(&copied);
+        let Value::Array(args) = &rendered else {
+            panic!("expected an argument array");
+        };
+        assert_eq!(field(&args[0], "display_text"), Some(&binary(b"\xff")));
+        assert_eq!(field(&args[0], "token"), Some(&binary(b"T\xfe")));
+        assert_eq!(
+            rendered,
+            Value::Array(vec![
+                Value::Map(vec![
+                    (bulk("name"), binary(b"value\xff")),
+                    (bulk("type"), bulk("string")),
+                    (bulk("display_text"), binary(b"\xff")),
+                    (bulk("token"), binary(b"T\xfe")),
+                    (bulk("summary"), binary(b"S\xfd")),
+                    (bulk("since"), binary(b"1.\xfc")),
+                    (bulk("deprecated_since"), binary(b"0.\xfb")),
+                    (
+                        bulk("flags"),
+                        Value::set(vec![
+                            Value::SimpleString(Bytes::from_static(b"optional")),
+                            Value::SimpleString(Bytes::from_static(b"multiple")),
+                            Value::SimpleString(Bytes::from_static(b"multiple_token")),
+                        ]),
+                    ),
+                ]),
+                Value::Map(vec![
+                    (bulk("name"), binary(b"fallback\xfa")),
+                    (bulk("type"), bulk("string")),
+                    (bulk("display_text"), binary(b"fallback\xfa")),
+                ]),
+                Value::Map(vec![
+                    (bulk("name"), binary(b"group\xf9")),
+                    (bulk("type"), bulk("block")),
+                    (
+                        bulk("arguments"),
+                        Value::Array(vec![Value::Map(vec![
+                            (bulk("name"), binary(b"choice\xf8")),
+                            (bulk("type"), bulk("pure-token")),
+                            (bulk("display_text"), binary(b"\xf3")),
+                            (bulk("token"), binary(b"\xf7")),
+                            (bulk("summary"), binary(b"child\xf6")),
+                            (bulk("since"), binary(b"\xf5")),
+                            (bulk("deprecated_since"), binary(b"\xf4")),
+                        ])]),
+                    ),
+                ]),
+            ])
+        );
+        let display = field(&args[0], "display_text").unwrap();
+        let token = field(&args[0], "token").unwrap();
+        assert_eq!(serialize_to_vec_resp2(display), b"$1\r\n\xff\r\n");
+        assert_eq!(serialize_to_vec_resp3(display), b"$1\r\n\xff\r\n");
+        assert_eq!(serialize_to_vec_resp2(token), b"$2\r\nT\xfe\r\n");
+        assert_eq!(serialize_to_vec_resp3(token), b"$2\r\nT\xfe\r\n");
+    }
+
+    #[test]
+    fn command_metadata_docs_keep_argument_tree_after_acl_updates() {
+        use crate::engine::extension::module::api::command_args::ModuleCommandArg;
+
+        let mut ctx = ServerContext::new(1);
+        ctx.module_registry_mut()
+            .register(ModuleRef::new("docs-probe", std::ptr::null_mut(), 1, true))
+            .unwrap();
+        ctx.module_registry_mut()
+            .register_command("docs-probe", "docs-probe.command", None)
+            .unwrap();
+        let info = ModuleCommandInfo {
+            summary: Some("Reads a payload.".into()),
+            since: Some("1.0.0".into()),
+            key_specs: Vec::new(),
+            acl_categories: Vec::new(),
+            legacy_keys: None,
+            getkeys_api: false,
+            arity: Some(-2),
+        };
+        let tree = vec![ModuleCommandArg {
+            name: "payload".into(),
+            arg_type: "string",
+            key_spec_index: None,
+            token: None,
+            summary: None,
+            since: None,
+            flags: vec!["optional"],
+            deprecated_since: None,
+            arguments: Vec::new(),
+            display_text: None,
+        }];
+        let prepared = ctx.module_registry()
+            .prepare_command_metadata("docs-probe.command", info, Some(tree.clone()))
+            .unwrap();
+        ctx.module_registry_mut()
+            .commit_command_metadata("docs-probe.command", prepared);
+        let expected = Value::Map(vec![
+            (bulk("summary"), bulk("Reads a payload.")),
+            (bulk("since"), bulk("1.0.0")),
+            (bulk("group"), bulk("module")),
+            (bulk("module"), bulk("docs-probe")),
+            (
+                bulk("arguments"),
+                Value::Array(vec![Value::Map(vec![
+                    (bulk("name"), bulk("payload")),
+                    (bulk("type"), bulk("string")),
+                    (bulk("display_text"), bulk("payload")),
+                    (bulk("flags"), optional_flags()),
+                ])]),
+            ),
+        ]);
+        assert_eq!(module_doc(&ctx, "docs-probe.command", "docs-probe"), expected);
+        assert!(ctx.module_registry_mut().set_command_info(
+            "docs-probe.command",
+            ModuleCommandInfo {
+                summary: None,
+                since: None,
+                key_specs: Vec::new(),
+                acl_categories: vec!["write".into()],
+                legacy_keys: None,
+                getkeys_api: false,
+                arity: None,
+            },
+        ));
+        assert_eq!(module_doc(&ctx, "docs-probe.command", "docs-probe"), expected);
+        let stored = ctx.module_registry().lookup_cmd_func("docs-probe.command").unwrap();
+        assert_eq!(stored.arguments.as_ref(), Some(&tree));
+        assert_eq!(stored.info.as_ref().unwrap().acl_categories, ["write"]);
+        assert_eq!(stored.info.as_ref().unwrap().arity, Some(-2));
+    }
 
     #[test]
     fn module_docs_keep_exported_fields_after_acl_metadata_updates() {
