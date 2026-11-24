@@ -648,7 +648,7 @@ impl ServerWorkerState {
         self.flush_cluster_bus_writes();
         self.pump_cluster_bus_reads();
         self.flush_cluster_bus_writes();
-        self.refresh_cluster_link_views();
+        self.refresh_pending_cluster_link_views();
     }
 
     fn run_expire_cycle(&mut self) {
@@ -2827,7 +2827,7 @@ mod tests {
             .queue
             .front_mut()
             .unwrap()
-            .drain(..64 * 1024);
+            .advance(64 * 1024);
         backend.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
             .consume_written_bytes(64 * 1024, queued_before)
             .unwrap();

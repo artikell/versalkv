@@ -29,7 +29,7 @@ impl ClusterBusManager {
                 Some(FailedPrimaryFacts {
                     node_id: NodeId::parse(primary.name.as_bytes()).ok()?,
                     shard_id: NodeId::parse(primary.shard_id.as_bytes()).ok()?,
-                    slots: primary.slots.clone(),
+                    slots: primary.slots.to_vec(),
                     is_failed: primary.has_flag(CLUSTER_NODE_FAIL),
                 })
             });
@@ -282,6 +282,7 @@ impl ClusterBusManager {
                     for connection in self.connections.values_mut() {
                         if connection.connected && !connection.node_name.is_empty() {
                             connection.write_buf.extend_from_slice(&request);
+                            self.pending_link_view_updates.insert(connection.token.0);
                             state.record_bus_message_sent(
                                 crate::engine::distributed::cluster::msg::ClusterMsgType::FailoverAuthRequest,
                             );
@@ -323,6 +324,7 @@ impl ClusterBusManager {
                             .expect("selected Cluster Bus connection must exist")
                             .write_buf
                             .extend_from_slice(&ack);
+                        self.mark_link_view_dirty(token);
                         state.record_bus_message_sent(
                             crate::engine::distributed::cluster::msg::ClusterMsgType::FailoverAuthAck,
                         );

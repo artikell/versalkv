@@ -79,6 +79,15 @@ impl Write for IncrementalSyncWriter {
 struct CancellablePipeWriter {
     file: std::fs::File,
     control: Arc<RdbSaveControl>,
+    #[cfg(test)]
+    test_wait: Option<PipeWriteTestWait>,
+}
+
+#[cfg(test)]
+struct PipeWriteTestWait {
+    entered: Sender<()>,
+    resume: Receiver<()>,
+    timeout: Duration,
 }
 
 impl Write for CancellablePipeWriter {
@@ -88,18 +97,44 @@ impl Write for CancellablePipeWriter {
             match self.file.write(bytes) {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    // Never join a serializer blocked in write(2). A bounded
-                    // wait also observes cancellation while the reader is idle.
-                    let state = self.control.lock();
-                    if state.is_cancelled {
-                        return Err(io::Error::other(SaveCancelled));
+                    let timeout = Duration::from_millis(1);
+                    #[cfg(test)]
+                    let timeout = if let Some(wait) = self.test_wait.take() {
+                        wait.entered.send(()).map_err(io::Error::other)?;
+                        wait.resume.recv().map_err(io::Error::other)?;
+                        wait.timeout
+                    } else {
+                        timeout
+                    };
+                    // Wait for pipe space rather than an unrelated feed notification.
+                    // Bound the wait so cancellation also works with an idle reader.
+                    #[cfg(unix)]
+                    {
+                        use crate::foundation::io::sys::os::{poll_descriptors, PollDescriptor};
+                        use std::os::fd::AsRawFd;
+
+                        self.control.check_cancelled()?;
+                        let mut descriptors =
+                            [PollDescriptor::new(self.file.as_raw_fd(), libc::POLLOUT)];
+                        match poll_descriptors(&mut descriptors, timeout) {
+                            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                            Err(error) => return Err(error),
+                            Ok(_) => {}
+                        }
                     }
-                    drop(
-                        self.control
-                            .changed
-                            .wait_timeout(state, Duration::from_millis(1))
-                            .unwrap_or_else(std::sync::PoisonError::into_inner),
-                    );
+                    #[cfg(not(unix))]
+                    {
+                        let state = self.control.lock();
+                        if state.is_cancelled {
+                            return Err(io::Error::other(SaveCancelled));
+                        }
+                        drop(
+                            self.control
+                                .changed
+                                .wait_timeout(state, timeout)
+                                .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        );
+                    }
                 }
                 result => return result,
             }
@@ -184,6 +219,10 @@ impl RdbSaveFeeder {
     pub(crate) fn finish(&mut self) {
         self.sender.take();
         self.control.notify_feed_changed();
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.sender.is_none() || self.control.check_cancelled().is_err()
     }
 }
 
@@ -349,9 +388,19 @@ impl RdbSaveControl {
         state.enqueued = state.enqueued.saturating_sub(1);
     }
 
-    pub(crate) fn finish_item(&self) -> io::Result<()> {
-        let delay_started = Instant::now();
+    pub(crate) fn finish_item<F>(&self, flush: F) -> io::Result<()>
+    where
+        F: FnOnce() -> io::Result<()>,
+    {
         let mut state = self.lock();
+        if !state.is_cancelled && state.key_delay_us != 0 {
+            // Select the wait while holding the configuration lock, but never
+            // hold that lock during a potentially backpressured output flush.
+            drop(state);
+            flush()?;
+            state = self.lock();
+        }
+        let delay_started = Instant::now();
         if state.key_delay_us < 0 {
             let delay_us = state.key_delay_us;
             drop(state);
@@ -420,6 +469,11 @@ fn feed_work_items(
     control.notify_feed_changed();
 }
 
+enum RdbOutput<'a> {
+    Bytes(&'a [u8]),
+    Flush,
+}
+
 fn serialize_work_items<F>(
     receiver: Receiver<FrozenWorkItem>,
     options: RdbSerializeOptions,
@@ -428,18 +482,20 @@ fn serialize_work_items<F>(
     mut emit: F,
 ) -> io::Result<()>
 where
-    F: FnMut(&[u8]) -> io::Result<()>,
+    F: FnMut(RdbOutput<'_>) -> io::Result<()>,
 {
     let mut crc = 0;
     let mut ws = LzfWorkspace::new(options.compression);
-    let mut write = |bytes: &[u8]| {
+    let mut write = |output: RdbOutput<'_>| {
         control.check_cancelled()?;
-        crc = crc64(crc, bytes);
-        emit(bytes)
+        if let RdbOutput::Bytes(bytes) = output {
+            crc = crc64(crc, bytes);
+        }
+        emit(output)
     };
     while let Some(item) = control.receive_work_item(&receiver)? {
         match item {
-            FrozenWorkItem::Header(header) => write(&header)?,
+            FrozenWorkItem::Header(header) => write(RdbOutput::Bytes(&header))?,
             FrozenWorkItem::Database {
                 id,
                 entries,
@@ -451,7 +507,7 @@ where
                 chunk.push(RDB_OPCODE_RESIZEDB);
                 save_len(&mut chunk, entries as u64);
                 save_len(&mut chunk, expires as u64);
-                write(&chunk)?;
+                write(RdbOutput::Bytes(&chunk))?;
             }
             FrozenWorkItem::Entry(entry) => {
                 control.begin_item()?;
@@ -464,20 +520,38 @@ where
                     entry.hash_field_expires.as_ref(),
                     &mut ws,
                 );
-                write(&chunk)?;
+                write(RdbOutput::Bytes(&chunk))?;
                 let completion = entry.completion.clone();
                 drop(entry);
                 if let (Some(completion), Some(sender)) = (completion, completed_items) {
                     let _ = sender.send(completion);
                 }
                 // Publish progress only after the release notification is visible.
-                control.finish_item()?;
+                control.finish_item(|| write(RdbOutput::Flush))?;
             }
         }
     }
-    write(&[RDB_OPCODE_EOF])?;
+    write(RdbOutput::Bytes(&[RDB_OPCODE_EOF]))?;
     let checksum: u64 = if options.checksum { crc } else { 0 };
-    emit(&checksum.to_le_bytes())
+    emit(RdbOutput::Bytes(&checksum.to_le_bytes()))
+}
+
+fn serialize_pipe_work_items<W: Write>(
+    receiver: Receiver<FrozenWorkItem>,
+    options: RdbSerializeOptions,
+    control: &RdbSaveControl,
+    writer: W,
+) -> io::Result<()> {
+    let mut writer = io::BufWriter::with_capacity(16 * 1024, writer);
+    let result = serialize_work_items(receiver, options, control, None, |output| match output {
+        RdbOutput::Bytes(chunk) => writer.write_all(chunk),
+        RdbOutput::Flush => writer.flush(),
+    })
+    .and_then(|()| writer.flush());
+    // Never let BufWriter's destructor retry after a write error or cancel.
+    // A successful finish already flushed the RDB checksum.
+    let (_writer, _pending) = writer.into_parts();
+    result
 }
 
 fn commit_temporary_snapshot<F>(
@@ -528,21 +602,24 @@ impl BackgroundRdbSave {
                 let mut writer = CancellablePipeWriter {
                     file: write,
                     control: Arc::clone(&worker_control),
+                    #[cfg(test)]
+                    test_wait: None,
                 };
                 let result = if serialization.compression == RdbCompression::Lz4 {
                     (|| -> io::Result<()> {
                         writer.write_all(VCS_RDB_HEADER)?;
                         let mut encoder = new_rdb_frame_encoder(writer, serialization.checksum);
-                        serialize_work_items(receiver, options, &worker_control, None, |chunk| {
-                            encoder.write_all(chunk)
+                        serialize_work_items(receiver, options, &worker_control, None, |output| {
+                            match output {
+                                RdbOutput::Bytes(chunk) => encoder.write_all(chunk),
+                                RdbOutput::Flush => Ok(()),
+                            }
                         })?;
                         encoder.finish().map_err(io::Error::other)?;
                         Ok(())
                     })()
                 } else {
-                    serialize_work_items(receiver, options, &worker_control, None, |chunk| {
-                        writer.write_all(chunk)
-                    })
+                    serialize_pipe_work_items(receiver, options, &worker_control, writer)
                 };
                 // Dropping the receiver unblocks the feeder on every error.
                 // The pipe writer closes before a successful result is joined.
@@ -605,7 +682,10 @@ impl BackgroundRdbSave {
                             options,
                             &worker_control,
                             Some(&completed_sender),
-                            |chunk| emit(chunk),
+                            |output| match output {
+                                RdbOutput::Bytes(chunk) => emit(chunk),
+                                RdbOutput::Flush => Ok(()),
+                            },
                         )
                     };
                     if serialization.compression == RdbCompression::Lz4 {
@@ -702,8 +782,11 @@ impl BackgroundRdbSave {
                 };
                 let result: io::Result<()> = (|| {
                     let serialize = |emit: &mut dyn FnMut(&[u8]) -> io::Result<()>| {
-                        serialize_work_items(receiver, options, &worker_control, None, |chunk| {
-                            emit(chunk)
+                        serialize_work_items(receiver, options, &worker_control, None, |output| {
+                            match output {
+                                RdbOutput::Bytes(chunk) => emit(chunk),
+                                RdbOutput::Flush => Ok(()),
+                            }
                         })
                     };
                     if serialization.compression == RdbCompression::Lz4 {
@@ -804,247 +887,4 @@ impl Drop for BackgroundRdbSave {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn freeze_source(source: &crate::foundation::io::store::kv_engine::DbSet) -> FrozenRdb {
-        FrozenRdb::capture(
-            source,
-            &[],
-            &[],
-            None,
-            RdbSerializeOptions::default(),
-            0,
-            true,
-        )
-    }
-
-    #[test]
-    fn pipe_serializer_preserves_frozen_values_and_reports_actual_progress() {
-        use crate::foundation::io::store::{kv_engine::DbSet, Robj};
-        use std::io::Read;
-        use std::os::fd::AsFd;
-        let mut source = DbSet::new(1);
-        source
-            .get_mut(0)
-            .unwrap()
-            .set(b"key".to_vec(), Robj::string("before"));
-        let frozen = freeze_source(&source);
-        source
-            .get_mut(0)
-            .unwrap()
-            .set(b"key".to_vec(), Robj::string("after"));
-        let (mut task, mut read) = BackgroundRdbSave::start_to_pipe(
-            frozen,
-            0,
-            RdbSnapshotOptions {
-                compression: RdbCompression::No,
-                checksum: true,
-            },
-        )
-        .unwrap();
-        crate::foundation::io::sys::fd::set_nonblocking(read.as_fd(), false).unwrap();
-        let mut bytes = Vec::new();
-        read.read_to_end(&mut bytes).unwrap();
-        assert!(matches!(task.finish(), RdbSaveOutcome::Saved));
-        let progress = task.control().progress();
-        assert_eq!(progress.total_keys, 1);
-        assert_eq!(progress.enqueued, 1);
-        assert_eq!(progress.processed, 1);
-        let mut loaded = DbSet::new(1);
-        crate::foundation::io::persistence::rdb::load_rdb_bytes(&bytes, &mut loaded).unwrap();
-        assert_eq!(
-            loaded
-                .get(0)
-                .unwrap()
-                .get_no_expire(b"key")
-                .unwrap()
-                .as_bytes(),
-            b"before"
-        );
-    }
-
-    #[test]
-    fn pipe_serializer_cancels_with_a_live_reader_and_a_full_pipe() {
-        use crate::foundation::io::store::{kv_engine::DbSet, Robj};
-        let mut source = DbSet::new(1);
-        source.get_mut(0).unwrap().set(
-            b"large".to_vec(),
-            Robj::string_raw("x".repeat(4 * 1024 * 1024)),
-        );
-        let (task, read) = BackgroundRdbSave::start_to_pipe(
-            freeze_source(&source),
-            0,
-            RdbSnapshotOptions {
-                compression: RdbCompression::No,
-                checksum: true,
-            },
-        )
-        .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while task.control().progress().current_item_ms == 0 && Instant::now() < deadline {
-            std::thread::yield_now();
-        }
-        assert!(
-            !task.is_finished(),
-            "a live unread pipe must backpressure the serializer"
-        );
-        let (sent, received) = channel();
-        let dropping = std::thread::spawn(move || {
-            drop(task);
-            sent.send(()).unwrap();
-        });
-        received
-            .recv_timeout(Duration::from_secs(2))
-            .expect("cancellation must not depend on closing the reader");
-        dropping.join().unwrap();
-        drop(read);
-    }
-
-    #[test]
-    fn incremental_save_drop_cancels_an_idle_receiver_with_a_live_feeder() {
-        let dir = std::env::temp_dir().join(format!(
-            "versal-rdb-idle-cancel-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let (task, feeder) = BackgroundRdbSave::start_incremental(
-            1,
-            dir.clone(),
-            "dump.rdb".to_string(),
-            1,
-            0,
-            false,
-            RdbSnapshotOptions {
-                compression: RdbCompression::No,
-                checksum: true,
-            },
-        )
-        .unwrap();
-        let (sender, receiver) = channel();
-        let dropping = std::thread::spawn(move || {
-            drop(task);
-            sender.send(()).unwrap();
-        });
-        let cancelled = receiver.recv_timeout(Duration::from_secs(1)).is_ok();
-        // Always close the feed and join, including the pre-fix failure case.
-        drop(feeder);
-        dropping.join().unwrap();
-        assert!(!dir.join("dump.rdb").exists());
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
-        std::fs::remove_dir_all(dir).unwrap();
-        assert!(cancelled, "cancellation must wake an idle work receiver");
-    }
-
-    #[test]
-    fn incremental_feeder_reports_full_without_consuming_item() {
-        let control = Arc::new(RdbSaveControl::new(2, 0));
-        let (sender, receiver) = sync_channel(1);
-        let feeder = RdbSaveFeeder::new(sender, Arc::clone(&control));
-        assert!(feeder.try_send(FrozenWorkItem::Header(vec![1])).is_ok());
-        let item = FrozenWorkItem::Header(vec![2]);
-        assert!(matches!(
-            feeder.try_send(item),
-            Err(FeedError::Full(item))
-                if matches!(item.as_ref(), FrozenWorkItem::Header(bytes) if bytes == &vec![2])
-        ));
-        assert!(matches!(
-            receiver.try_recv(),
-            Ok(FrozenWorkItem::Header(bytes)) if bytes == vec![1]
-        ));
-    }
-
-    #[test]
-    fn queue_progress_tracks_only_materialized_items() {
-        let control = RdbSaveControl::new(65_536, 0);
-        for _ in 0..WORK_QUEUE_CAPACITY {
-            control.queued_item().unwrap();
-        }
-        let progress = control.progress();
-        assert_eq!(progress.queue_length, WORK_QUEUE_CAPACITY);
-        assert_eq!(progress.queue_length_target, WORK_QUEUE_CAPACITY);
-
-        control.begin_item().unwrap();
-        let progress = control.progress();
-        assert_eq!(progress.queue_length, WORK_QUEUE_CAPACITY);
-        assert_eq!(progress.enqueued, WORK_QUEUE_CAPACITY);
-        control.finish_item().unwrap();
-        assert_eq!(control.progress().queue_length, WORK_QUEUE_CAPACITY - 1);
-    }
-
-    #[test]
-    fn incremental_lz4_save_streams_before_the_feed_finishes() {
-        let dir = std::env::temp_dir().join(format!(
-            "versal-forkless-lz4-stream-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let save_counter = 7;
-        let temporary = dir.join(format!(
-            "temp-forkless-{}-{save_counter}.rdb",
-            std::process::id()
-        ));
-        let (mut task, feeder) = BackgroundRdbSave::start_incremental(
-            0,
-            dir.clone(),
-            "dump.rdb".to_string(),
-            save_counter,
-            0,
-            false,
-            RdbSnapshotOptions {
-                compression: RdbCompression::Lz4,
-                checksum: true,
-            },
-        )
-        .unwrap();
-        assert!(feeder
-            .try_send(FrozenWorkItem::Header(vec![b'x'; 256 * 1024]))
-            .is_ok());
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while std::fs::metadata(&temporary)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0)
-            == 0
-            && Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-
-        assert!(
-            std::fs::metadata(&temporary).unwrap().len() > 0,
-            "the compressed stream must reach disk before the feeder closes"
-        );
-
-        task.control().cancel();
-        drop(feeder);
-        let _ = task.finish();
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn directory_sync_failure_does_not_mark_snapshot_committed() {
-        let dir = std::env::temp_dir().join(format!(
-            "versal-rdb-commit-sync-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let temporary = dir.join("temporary.rdb");
-        let destination = dir.join("dump.rdb");
-        std::fs::write(&temporary, b"snapshot").unwrap();
-        let control = RdbSaveControl::new(0, 0);
-
-        let result = commit_temporary_snapshot(&temporary, &destination, &control, || {
-            Err(io::Error::other("injected directory sync failure"))
-        });
-
-        assert!(result.is_err());
-        assert!(!control.lock().is_committed);
-        assert_eq!(std::fs::read(destination).unwrap(), b"snapshot");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-}
+mod tests;
