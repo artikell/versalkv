@@ -859,6 +859,9 @@ impl ServerWorkerState {
     }
 
     fn commit_slot_import(&mut self, id: &MigrationJobId) {
+        if self.wait_for_slot_migration_durability(id) {
+            return;
+        }
         let ranges = self
             .ctx
             .cluster_state()
@@ -909,6 +912,7 @@ impl ServerWorkerState {
     }
 
     fn cleanup_slot_migration(&mut self, id: &MigrationJobId) {
+        self.slot_migration_durability_waits.remove(id);
         let terminal_import = self
             .ctx
             .cluster_state()
@@ -947,11 +951,11 @@ impl ServerWorkerState {
             }
             let refs = fields.iter().map(Vec::as_slice).collect::<Vec<_>>();
             let frame = encode_command(&refs);
-            self.propagate_to_replicas(&frame);
             if self.ctx.config().persistence.aof_enabled {
                 self.feed_aof(&frame);
                 self.flush_aof_if_needed();
             }
+            self.propagate_to_replicas(&frame);
         }
         self.abort_slot_snapshot(id);
         let mut connections = self
@@ -1017,6 +1021,7 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn drive_slot_migration_progress(&mut self) {
+        self.refresh_slot_migration_durability_waits();
         self.expire_stalled_slot_migrations();
         self.trim_slot_migration_log();
         self.drive_slot_migration_actions();
@@ -1055,7 +1060,15 @@ impl ServerWorkerState {
                         .migrations
                         .active_export_views()
                         .into_iter()
-                        .filter_map(|job| match job.phase {
+                        .filter_map(|job| {
+                            // Only jobs that actually encountered local durability
+                            // backpressure may outlive the original pause deadline.
+                            if self.ctx.config().replication.repl_after_aof_fsync
+                                && self.slot_migration_durability_waits.contains(&job.id)
+                            {
+                                return None;
+                            }
+                            match job.phase {
                             MigrationPhase::Export(ExportPhase::FailoverPaused) => {
                                 Some((job.id, "Timed out before streaming completed"))
                             }
@@ -1064,6 +1077,7 @@ impl ServerWorkerState {
                                 "Unpaused before migration completed (migration may have succeeded with lost writes)",
                             )),
                             _ => None,
+                            }
                         })
                         .collect::<Vec<_>>()
                 } else {
@@ -1100,7 +1114,10 @@ impl ServerWorkerState {
         {
             self.commit_slot_import(&id);
         }
-        for id in complete_exports {
+        'complete_exports: for id in complete_exports {
+            if self.wait_for_slot_migration_durability(&id) {
+                continue;
+            }
             let ranges = self
                 .ctx
                 .cluster_state()
@@ -1110,6 +1127,11 @@ impl ServerWorkerState {
             if let Some(ranges) = ranges {
                 for range in ranges.iter() {
                     for slot in range.start..=range.end {
+                        if self.wait_for_slot_migration_durability(&id) {
+                            continue 'complete_exports;
+                        }
+                        // Removed slots remain empty on retry; live entries are
+                        // the cleanup cursor until every deletion is admitted.
                         let entries = self.ctx.take_slot_entries(slot as usize);
                         if !entries.is_empty() {
                             self.ctx.persistence_mut().add_dirty(entries.len() as i64);
@@ -1119,6 +1141,9 @@ impl ServerWorkerState {
                         }
                     }
                 }
+            }
+            if self.wait_for_slot_migration_durability(&id) {
+                continue;
             }
             let actions = self
                 .ctx

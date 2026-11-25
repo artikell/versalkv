@@ -147,6 +147,7 @@ impl ServerWorkerState {
         previous_config: crate::framework::context::RuntimeConfig,
     ) {
         *self.ctx.config_mut() = previous_config;
+        self.ctx.sync_eviction_policy();
         if let Err(error) =
             crate::framework::commands::server::config::apply_cluster_config_snapshot(&mut self.ctx)
         {

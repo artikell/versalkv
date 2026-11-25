@@ -246,7 +246,7 @@ impl ServerWorkerState {
         executor: CommandExecutor,
         args: &CommandArgs,
     ) -> Value {
-        self.ctx.set_forkless_capture_expiration_paused(false);
+        self.update_pause_skip_expire();
         let replica_local_expire_only =
             self.ctx.replication().is_replica() && !self.ctx.config().replication.replica_read_only;
         // Reset every DB's replica-local-expire flag so that per-command
@@ -350,7 +350,7 @@ impl ServerWorkerState {
             args,
         );
         // CLIENT UNPAUSE and save handlers can change DB-local guards.
-        self.ctx.set_forkless_capture_expiration_paused(false);
+        self.update_pause_skip_expire();
         drop(time_guard);
         if matches!(executor, CommandExecutor::Hosted { .. }) {
             self.refresh_event_loop_cycle_time_after_execution();
@@ -882,6 +882,30 @@ impl ServerWorkerState {
         effects
             .cluster_publish_shard
             .extend(connection_effects.take_cluster_shard_notifications());
+        if self.ctx.config().replication.repl_after_aof_fsync {
+            for operation in &mut operations {
+                if operation.persistence
+                    != crate::engine::extension::script::PropagationPersistence::Data
+                {
+                    continue;
+                }
+                operation.targets = match operation.targets {
+                    PropagationTargets::None => PropagationTargets::Aof,
+                    PropagationTargets::Replication => PropagationTargets::Both,
+                    target => target,
+                };
+            }
+        } else {
+            for operation in &operations {
+                if operation.persistence
+                    == crate::engine::extension::script::PropagationPersistence::Data
+                    && (!operation.targets.includes_aof()
+                        || !self.ctx.config().persistence.aof_enabled)
+                {
+                    self.ctx.aof_mut().invalidate_replication_baseline();
+                }
+            }
+        }
         self.dispose_data_lazyfree_objects(connection_effects.take_lazyfree_objects());
         CommandPropagationCapture {
             swapdb: state.swapdb,

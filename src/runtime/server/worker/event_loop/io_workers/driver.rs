@@ -30,6 +30,7 @@ impl ServerWorkerState {
             Ok(()) => Some(Value::ok()),
             Err(error) => {
                 *self.ctx.config_mut() = request.previous;
+                self.ctx.sync_eviction_policy();
                 Some(Value::error(format!(
                     "ERR CONFIG SET failed (possibly related to argument 'io-threads') - {error}"
                 )))

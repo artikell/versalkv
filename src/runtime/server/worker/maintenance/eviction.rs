@@ -61,6 +61,10 @@ impl ServerWorkerState {
     }
 
     pub(crate) fn perform_evictions(&mut self) -> EvictionOutcome {
+        if self.ctx.replication_aof_write_error().is_some() {
+            self.cancel_eviction_timer();
+            return EvictionOutcome::empty();
+        }
         let maxmemory = self.ctx.config().server.maxmemory;
         if maxmemory == 0 {
             self.cancel_eviction_timer();
@@ -232,6 +236,26 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const ISOLATION_MARKER: &str = "VALKEY_TEST_MAXMEMORY_EVICTION_CYCLE";
+
+    #[test]
+    fn strict_aof_fault_prevents_key_eviction() {
+        let mut runtime = ServerWorkerState::new(1).unwrap();
+        runtime.ctx.config_mut().replication.repl_after_aof_fsync = true;
+        runtime.ctx.config_mut().server.maxmemory_policy = "allkeys-random".to_string();
+        runtime.ctx.config_mut().server.maxmemory = 1;
+        runtime
+            .ctx
+            .db_mut(0)
+            .unwrap()
+            .set(b"key".to_vec(), Robj::string("value"));
+        assert!(runtime.perform_evictions().evicted.is_empty());
+        assert!(runtime
+            .ctx
+            .db(0)
+            .unwrap()
+            .get_allow_expired(b"key")
+            .is_some());
+    }
 
     fn assert_no_candidate_sampling_is_bounded(
         runtime: &mut crate::runtime::server::worker::ServerWorkerState,

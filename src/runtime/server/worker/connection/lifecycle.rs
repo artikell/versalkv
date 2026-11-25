@@ -187,6 +187,7 @@ impl ServerWorkerState {
         if !self.retiring_connections.insert(token) {
             return;
         }
+        self.ctx.abort_upstream_transaction(token_value);
         self.retire_runtime_source(token);
         self.ctx.throttled_clients_mut().shift_remove(&token);
         self.full_sync.pending_dual_rdb_snapshots.remove(&token);

@@ -9,8 +9,7 @@ pub(super) fn config_set_misc(
     // Upstream's commandlog coverage clears these sensitive credentials even
     // when TLS is disabled. Clearing an absent TLS secret is a safe no-op;
     // accepting a non-empty secret would misleadingly claim TLS support.
-    if matches!(param, "tls-key-file-pass" | "tls-client-key-file-pass") && val_trimmed.is_empty()
-    {
+    if matches!(param, "tls-key-file-pass" | "tls-client-key-file-pass") && val_trimmed.is_empty() {
         return Ok(());
     }
     if param.starts_with("tls-") {

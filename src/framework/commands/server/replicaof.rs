@@ -65,7 +65,7 @@ pub fn replicaof(
                 ctx.replication_mut().rebind_replica_resume_on_next_reconnect = true;
             }
         } else if was_replica {
-            ctx.replication_mut().switch_to_primary();
+            ctx.replication_mut().request_switch_to_primary();
         }
         if current_target != previous_target {
             ctx.replication_mut().pending_replicaof_request = true;

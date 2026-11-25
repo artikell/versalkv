@@ -787,16 +787,6 @@ impl ServerWorkerState {
         pending_replication: Option<&mut Vec<Vec<u8>>>,
         pending_aof: Option<&mut Vec<Vec<u8>>>,
     ) {
-        match pending_replication {
-            Some(frames) => frames.extend(replication),
-            None => {
-                if !self.ctx.replication().is_replica() {
-                    for frame in &replication {
-                        self.propagate_to_replicas(frame);
-                    }
-                }
-            }
-        }
         match pending_aof {
             Some(frames) => frames.extend(aof),
             None => {
@@ -805,6 +795,16 @@ impl ServerWorkerState {
                 }
                 if !aof.is_empty() {
                     self.flush_aof_if_needed();
+                }
+            }
+        }
+        match pending_replication {
+            Some(frames) => frames.extend(replication),
+            None => {
+                if !self.ctx.replication().is_replica() {
+                    for frame in &replication {
+                        self.propagate_to_replicas(frame);
+                    }
                 }
             }
         }
@@ -1130,16 +1130,6 @@ impl ServerWorkerState {
             return;
         }
         let sequenced = self.sequence_wakeup_propagation(connection_token, &propagation_ops);
-        match pending_replication {
-            Some(frames) => frames.extend(sequenced.replication_frames),
-            None => {
-                if !self.ctx.replication().is_replica() {
-                    for frame in &sequenced.replication_frames {
-                        self.propagate_to_replicas(frame);
-                    }
-                }
-            }
-        }
         match pending_aof {
             Some(frames) => frames.extend(sequenced.aof_frames),
             None => {
@@ -1148,6 +1138,16 @@ impl ServerWorkerState {
                 }
                 if !sequenced.aof_frames.is_empty() {
                     self.flush_aof_if_needed();
+                }
+            }
+        }
+        match pending_replication {
+            Some(frames) => frames.extend(sequenced.replication_frames),
+            None => {
+                if !self.ctx.replication().is_replica() {
+                    for frame in &sequenced.replication_frames {
+                        self.propagate_to_replicas(frame);
+                    }
                 }
             }
         }

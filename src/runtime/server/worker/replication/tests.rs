@@ -2661,6 +2661,7 @@ fn eof_marker_only_on_rdb_channel_in_dual_mode() {
 mod diskless_completion;
 mod dual;
 mod dual_pause;
+mod durability;
 mod full_sync;
 mod import_tracking;
 mod paused_dual;

@@ -59,6 +59,15 @@ impl ServerWorkerState {
             self.fail_slot_migration(&id, "RESET is not allowed on a slot migration connection");
             return true;
         }
+        if self.ctx.replication_aof_write_error().is_some() {
+            self.connection_registry[crate::framework::capabilities::io::Token(connection_token)]
+                .mark_closing();
+            self.fail_slot_migration(
+                &id,
+                "Local AOF durability is unavailable during slot import",
+            );
+            return true;
+        }
         let command_flags = self.registry.lookup(&args.name).map_or(0, |spec| {
             crate::runtime::server::worker::command::dispatch::subcmd_flags::effective_command_flags_for_call(
                 spec.name.as_str(),
@@ -118,13 +127,13 @@ impl ServerWorkerState {
                 self.ctx
                     .persistence_mut()
                     .set_aof_selected_db(sequenced.aof_selected_db);
-                for frame in &sequenced.replication_frames {
-                    self.propagate_to_replicas(frame);
-                }
                 if self.ctx.config().persistence.aof_enabled {
                     for frame in &sequenced.aof_frames {
                         self.feed_aof(frame);
                     }
+                }
+                for frame in &sequenced.replication_frames {
+                    self.propagate_to_replicas(frame);
                 }
             }
             self.propagate_slot_import_evictions();

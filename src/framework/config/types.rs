@@ -166,6 +166,9 @@ pub struct Config {
     #[arg(long, default_value_t = false)]
     pub appendonly: bool,
 
+    #[arg(skip)]
+    pub repl_after_aof_fsync: bool,
+
     #[arg(skip = true)]
     pub rdb_save_incremental_fsync: bool,
 
@@ -563,6 +566,7 @@ impl Config {
     }
 
     fn apply_replication_config(&self, rconfig: &mut RuntimeConfig) {
+        rconfig.replication.repl_after_aof_fsync = self.repl_after_aof_fsync;
         // Startup replication must be installed before RDB AUX restoration.
         rconfig
             .replication

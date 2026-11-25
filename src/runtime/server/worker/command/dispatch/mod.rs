@@ -39,6 +39,24 @@ use std::borrow::Cow;
 
 pub(crate) use crate::engine::command::command_may_mutate_dataset;
 
+fn requires_propagation_boundary(name: &[u8], args: &CommandArgs) -> bool {
+    if name.eq_ignore_ascii_case(b"psync") || name.eq_ignore_ascii_case(b"sync") {
+        return true;
+    }
+    if name.eq_ignore_ascii_case(b"config") {
+        return args
+            .args
+            .first()
+            .is_some_and(|subcommand| subcommand.eq_ignore_ascii_case(b"SET"));
+    }
+    name.eq_ignore_ascii_case(b"replconf")
+        && args.args.iter().any(|argument| {
+            argument.eq_ignore_ascii_case(b"rdb-channel")
+                || argument.eq_ignore_ascii_case(b"main-channel")
+                || argument.eq_ignore_ascii_case(b"set-rdb-client-id")
+        })
+}
+
 impl ServerWorkerState {
     pub(crate) fn pre_dispatch_exec(
         &mut self,

@@ -317,6 +317,10 @@ impl ServerWorkerState {
         if self.ctx.persistence().has_active_child() {
             return None;
         }
+        if let Err(error) = self.ctx.ensure_replication_snapshot_durable() {
+            crate::server_log!(warning, "Downstream snapshot blocked: {}", error);
+            return None;
+        }
         let boundary = self.ctx.replication().backlog.snapshot_boundary();
         let connection = self
             .replication_runtime

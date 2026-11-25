@@ -23,6 +23,16 @@ impl ServerWorkerState {
     }
 
     pub(super) fn queue_command_propagation(&mut self, effects: &mut ReadBatchEffects) {
+        self.queue_propagation_frames(&effects.replication_only, &effects.aof_only);
+        effects.aof_only.clear();
+        effects.replication_only.clear();
+        self.reject_blocked_waitaof_local_if_aof_disabled();
+    }
+
+    pub(super) fn queue_propagation_frames(&mut self, replication: &[Vec<u8>], aof: &[Vec<u8>]) {
+        for frame in aof {
+            self.feed_aof(frame);
+        }
         // C `shouldPropagate(PROPAGATE_REPL)` only feeds a local command to
         // the replication stream when this server has no upstream primary.
         // A writable replica may accept local writes, but those writes must
@@ -30,16 +40,10 @@ impl ServerWorkerState {
         // former primary after failover. Upstream frames take the separate
         // replica-apply relay path and remain eligible for chaining.
         if !self.ctx.replication().is_replica() {
-            for frame in effects.replication_only.drain(..) {
-                self.propagate_to_replicas(&frame);
+            for frame in replication {
+                self.propagate_to_replicas(frame);
             }
-        } else {
-            effects.replication_only.clear();
         }
-        for frame in effects.aof_only.drain(..) {
-            self.feed_aof(&frame);
-        }
-        self.reject_blocked_waitaof_local_if_aof_disabled();
     }
 
     fn deliver_observer_effects(&mut self, effects: &mut ReadBatchEffects) {

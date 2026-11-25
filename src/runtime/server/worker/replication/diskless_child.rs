@@ -148,6 +148,10 @@ impl ServerWorkerState {
         if self.ctx.persistence().has_active_child() || self.full_sync.diskless_relay.is_some() {
             return None;
         }
+        if let Err(error) = self.ctx.ensure_replication_snapshot_durable() {
+            crate::server_log!(warning, "Downstream snapshot blocked: {}", error);
+            return None;
+        }
         let plan = self.full_sync_save_plan(connections, snapshot);
         if plan.channel == super::full_sync_plan::FullSyncChannel::Dual
             && self.ctx.config().server.debug_pause_after_fork

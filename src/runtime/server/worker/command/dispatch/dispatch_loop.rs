@@ -81,14 +81,19 @@ impl ServerWorkerState {
         batch: &mut ReadBatchEffects,
     ) -> LoopAction {
         let name = name.into();
-        if matches!(
-            self.connection_registry[token].slot_migration_role,
-            Some(SlotMigrationConnectionRole::Import(_))
-        ) && (!batch.replication_only.is_empty() || !batch.aof_only.is_empty())
+        if self.ctx.config().replication.repl_after_aof_fsync
+            || super::requires_propagation_boundary(&name, &args)
+            || (matches!(
+                self.connection_registry[token].slot_migration_role,
+                Some(SlotMigrationConnectionRole::Import(_))
+            ) && (!batch.replication_only.is_empty() || !batch.aof_only.is_empty()))
         {
-            // Import commands propagate immediately. Publish earlier commands
-            // before that path changes either stream's selected database.
+            // Publish earlier commands before admission, snapshots, or config
+            // changes observe the stream and its selected database.
             self.queue_command_propagation(batch);
+        }
+        if self.ctx.config().replication.repl_after_aof_fsync {
+            self.update_pause_skip_expire();
         }
         self.refresh_connection_priorities();
         // Skip priority bookkeeping only when neither admitted subnet clients

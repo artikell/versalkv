@@ -334,10 +334,15 @@ impl PrimaryLink {
         let read_cursor = self
             .dual_main_resume_read_cursor
             .unwrap_or(self.next_send_cursor);
+        if read_cursor > backlog.replication_release_cursor()
+            || (read_cursor == backlog.replication_release_cursor() && read_cursor < backlog_end)
+        {
+            return Ok(Vec::new());
+        }
         let read = if self.compression.is_some() {
-            backlog.read_from_bounded(read_cursor, REPLICATION_BATCH_BYTES)
+            backlog.read_released_from_bounded(read_cursor, REPLICATION_BATCH_BYTES)
         } else {
-            backlog.read_from(read_cursor)
+            backlog.read_released_from(read_cursor)
         };
         let bytes = match read {
             Some(bytes) => bytes,
@@ -365,7 +370,7 @@ impl PrimaryLink {
             return Ok(wire);
         }
         Self::enforce_cursor_invariant(self.sent_cursor, backlog_end, backlog_end)?;
-        self.next_send_cursor = backlog_end;
+        self.next_send_cursor = backlog.replication_release_cursor();
         self.dual_main_resume_read_cursor = None;
         self.dual_main_backlog_pin_cursor = None;
         Self::enforce_cursor_invariant(self.sent_cursor, self.next_send_cursor, backlog_end)?;

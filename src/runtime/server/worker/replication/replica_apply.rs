@@ -408,6 +408,12 @@ impl ServerWorkerState {
         link: &mut ReplicaLink,
         commit: RdbCommit,
     ) -> Result<(), ()> {
+        if self.ctx.config().replication.repl_after_aof_fsync && commit.swapped.is_none() {
+            // Direct loading has already mutated the serving dataset. An old AOF
+            // cannot prove its baseline if any terminal commit step fails.
+            self.ctx.aof_mut().replication_baseline =
+                crate::engine::persistence::AofBaseline::Unavailable;
+        }
         let rdb_apply_position = link
             .prevalidate_rdb_commit_position(commit.repl_id.as_deref(), commit.repl_offset)
             .map_err(|_| ())?;
@@ -423,19 +429,33 @@ impl ServerWorkerState {
             connection_token
         };
         let mut prepared = self.prepare_streamed_rdb_commit(commit)?;
-        let mut aof_base = self.prepare_synced_rdb_aof_base(&prepared)?;
+        let mut aof_base = self.prepare_synced_rdb_aof_base(&prepared, link, rdb_apply_position)?;
         let received_rdb = self.prepare_received_rdb(&prepared, link.session_id())?;
         let delete_received_rdb = self.should_delete_received_sync_rdb();
         let received_rdb_target = received_rdb.as_ref().map(|rdb| rdb.target.clone());
-        if let Some(aof_base) = aof_base.as_mut() {
-            aof_base.manifest.commit_manifest().map_err(|_| ())?;
+        let install_result = aof_base
+            .as_mut()
+            .map_or(Ok(()), |aof_base| aof_base.manifest.commit_manifest());
+        if let Err(error) = install_result {
+            crate::server_log!(warning, "Failed to commit full-sync AOF manifest: {error}");
+            self.rollback_prepared_aof_base(aof_base.take())?;
+            return Err(());
         }
         if let Some(received_rdb) = received_rdb {
-            received_rdb.commit().map_err(|_| ())?;
+            if received_rdb.commit().is_err() {
+                self.rollback_prepared_aof_base(aof_base.take())?;
+                return Err(());
+            }
         }
-        if !prepared.functions_applied {
-            self.install_prepared_functions(&prepared.function_codes)?;
+        if !prepared.functions_applied
+            && self
+                .install_prepared_functions(&prepared.function_codes)
+                .is_err()
+        {
+            self.rollback_prepared_aof_base(aof_base.take())?;
+            return Err(());
         }
+        self.discard_upstream_transactions();
         self.install_prepared_dataset(link, &mut prepared, rdb_boundary);
         self.install_prepared_aux(&prepared.aux_fields);
         // Direct and disk loads replace old migrations before restoring AUX.
@@ -561,28 +581,85 @@ impl ServerWorkerState {
     fn prepare_synced_rdb_aof_base(
         &mut self,
         prepared: &PreparedRdbCommit,
+        link: &ReplicaLink,
+        rdb_apply_position: ReplicationOffset,
     ) -> Result<Option<PreparedAofBaseInstall>, ()> {
         let config = self.ctx.config().persistence.clone();
-        let should_reuse =
-            config.aof_enabled && config.aof_use_rdb_preamble && prepared.disk_backed;
+        let is_strict = self.ctx.config().replication.repl_after_aof_fsync;
+        if is_strict && !config.aof_enabled {
+            crate::server_log!(warning, "Strict replication requires an enabled local AOF");
+            return Err(());
+        }
+        let should_reuse = config.aof_enabled
+            && (is_strict || (config.aof_use_rdb_preamble && prepared.disk_backed));
+        // Even an asynchronous rewrite must not replace a dataset after an unchecked old write.
+        if let Some(journal) = self.ctx.aof_mut().journal.as_mut() {
+            let result = if should_reuse {
+                journal.appender.shutdown()
+            } else {
+                journal.appender.flush(true)
+            };
+            if let Err(error) = result {
+                self.ctx.aof_mut().last_write_status =
+                    crate::engine::persistence::OperationStatus::Err;
+                crate::server_log!(
+                    warning,
+                    "Failed to sync old AOF before full-sync commit: {error}"
+                );
+                return Err(());
+            }
+        }
         if !should_reuse {
             return Ok(None);
         }
-        if let Some(journal) = self.ctx.aof_mut().journal.as_mut() {
-            journal.appender.flush(true).map_err(|_| ())?;
-        }
+        // A one-time RDB base is safe even under the text-rewrite policy. Incremental
+        // writes remain RESP, and later rewrites continue honoring that policy.
+        let serialized;
+        let bytes = if is_strict {
+            let replication = crate::foundation::io::persistence::RdbReplicationInfo {
+                repl_stream_db: i64::from(prepared.repl_stream_db),
+                repl_id: link
+                    .master_replid()
+                    .unwrap_or(self.ctx.replication().backlog.replid())
+                    .to_string(),
+                repl_offset: rdb_apply_position.get(),
+                aux_fields: prepared.aux_fields.clone(),
+            };
+            serialized = crate::foundation::io::persistence::serialize_all_with_functions_and_replication_with_options(
+                prepared.swapped.as_ref().unwrap_or(self.ctx.dbs()),
+                0,
+                &prepared.function_codes,
+                true,
+                Some(&replication),
+                &[],
+                crate::foundation::io::persistence::RdbSerializeOptions {
+                    compression: config.rdbcompression.uses_lzf(),
+                    checksum: true,
+                },
+            );
+            serialized.as_slice()
+        } else {
+            prepared.raw.as_deref().ok_or(())?
+        };
         let manifest = crate::foundation::io::persistence::prepare_synced_rdb_as_aof_base(
             &config.dir,
             &config.aof_filename,
             &config.aof_appenddirname,
-            prepared.raw.as_deref().unwrap(),
+            bytes,
         )
-        .map_err(|_| ())?;
-        let appender = crate::foundation::io::persistence::AofAppender::open_append_path(
+        .map_err(|error| {
+            crate::server_log!(warning, "Failed to prepare full-sync AOF baseline: {error}");
+        })?;
+        let mut appender = crate::foundation::io::persistence::AofAppender::open_append_path(
             manifest.incremental_path(),
             config.aof_fsync,
         )
-        .map_err(|_| ())?;
+        .map_err(|error| {
+            crate::server_log!(warning, "Failed to open full-sync AOF increment: {error}");
+        })?;
+        appender.flush(true).map_err(|error| {
+            crate::server_log!(warning, "Failed to sync full-sync AOF increment: {error}");
+        })?;
         Ok(Some(PreparedAofBaseInstall {
             manifest,
             journal: crate::foundation::io::persistence::journal::AofJournal::new(appender),
@@ -590,17 +667,43 @@ impl ServerWorkerState {
     }
 
     fn publish_prepared_aof_base(&mut self, prepared: Option<PreparedAofBaseInstall>) {
-        let Some(prepared) = prepared else {
+        let Some(mut prepared) = prepared else {
             return;
         };
+        prepared
+            .journal
+            .appender
+            .record_installed_path(prepared.manifest.installed_incremental_path());
         self.ctx.reset_repl_seldb();
         self.ctx.persistence_mut().reset_aof_selected_db();
         self.ctx
             .persistence_mut()
             .record_aof_size(prepared.journal.appender.current_size());
         self.ctx.aof_mut().journal = Some(prepared.journal);
+        self.ctx.aof_mut().replication_baseline = crate::engine::persistence::AofBaseline::Ready;
         prepared.manifest.finalize();
-        crate::server_log!(notice, "Reused RDB file from primary sync as AOF base file");
+        if self.ctx.config().replication.repl_after_aof_fsync {
+            crate::server_log!(notice, "Installed synchronized full-sync AOF baseline");
+        } else {
+            crate::server_log!(notice, "Reused RDB file from primary sync as AOF base file");
+        }
+    }
+
+    fn rollback_prepared_aof_base(
+        &mut self,
+        prepared: Option<PreparedAofBaseInstall>,
+    ) -> Result<(), ()> {
+        let Some(prepared) = prepared else {
+            return Ok(());
+        };
+        self.ctx.aof_mut().invalidate_replication_baseline();
+        self.ctx.aof_mut().last_write_status = crate::engine::persistence::OperationStatus::Err;
+        if self.ctx.config().persistence.aof_enabled {
+            self.ctx.persistence_mut().set_aof_rewrite_scheduled(true);
+        }
+        prepared.manifest.rollback().map_err(|error| {
+            crate::server_log!(warning, "Full-sync AOF manifest rollback failed; retaining both baselines and blocking durability: {error}");
+        })
     }
 
     fn install_prepared_dataset(
@@ -622,6 +725,7 @@ impl ServerWorkerState {
             self.reset_downstream_after_full_sync(link.connection_id());
         }
         if let Some(dbs) = prepared.swapped.take() {
+            self.ctx.aof_mut().invalidate_replication_baseline();
             *self.ctx.dbs_mut() = dbs;
         }
     }
@@ -725,7 +829,6 @@ impl ServerWorkerState {
             link.rdb_channel_state()
         );
     }
-
     pub(crate) fn commit_and_replay_dual_handoff_only(
         &mut self,
         connection_token: usize,
@@ -1192,15 +1295,33 @@ impl ServerWorkerState {
             ReplicationApply::Command(args) if args.name.eq_ignore_ascii_case(b"EXEC")
         );
         let is_outer_execution = self.command_execution_depth == 0;
-        let execution =
-            match self.handle_replication_transaction_frame(connection_token, link, &apply) {
-                Ok(Some(duration_us)) => Ok(duration_us),
-                Ok(None) => {
-                    self.apply_replication_command_now(connection_token, link, apply, true, None)
+        let result = self.apply_replication_frame(connection_token, link, apply);
+        if result.is_err() {
+            self.ctx.abort_upstream_transaction(connection_token);
+        }
+        let is_active = self
+            .connection_registry
+            .get_mut(Token(connection_token))
+            .is_some_and(|conn| {
+                if result.is_err() {
+                    conn.transaction.end(TransactionEnd::Reset);
                 }
-                Err(error) => Err(error),
-            };
-        let duration_us = execution?;
+                conn.transaction.is_active()
+            });
+        // EXEC clears the client queue before running it. Keep its owner registered
+        // until all execution, AOF, relay and blocked-client side effects return.
+        if is_active {
+            // Mainline buffers the complete transaction in both durability modes.
+            let phase = crate::engine::distributed::replication::UpstreamTransactionPhase::Buffered;
+            self.ctx
+                .replication_mut()
+                .record_upstream_transaction(connection_token, phase);
+        } else {
+            self.ctx
+                .replication_mut()
+                .end_upstream_transaction(connection_token);
+        }
+        let duration_us = result?;
         self.refresh_connection_priorities();
         if is_outer_execution
             && (!was_transaction_active || is_exec)
@@ -1210,6 +1331,33 @@ impl ServerWorkerState {
             self.ctx.stats_mut().record_priority_command(duration_us);
         }
         Ok(())
+    }
+
+    pub(super) fn discard_upstream_transactions(&mut self) {
+        for connection in self.ctx.abort_upstream_transactions() {
+            if let Some(conn) = self.connection_registry.get_mut(Token(connection)) {
+                conn.transaction.end(TransactionEnd::Reset);
+            }
+        }
+    }
+
+    fn apply_replication_frame(
+        &mut self,
+        connection_token: usize,
+        link: &mut ReplicaLink,
+        apply: ReplicationApply,
+    ) -> Result<u64, ()> {
+        if matches!(&apply, ReplicationApply::Command(args) if self.replicated_command_requires_durable_aof(args))
+            && self.ctx.replication_aof_write_error().is_some()
+        {
+            return Err(());
+        }
+        if let Some(duration_us) =
+            self.handle_replication_transaction_frame(connection_token, link, &apply)?
+        {
+            return Ok(duration_us);
+        }
+        self.apply_replication_command_now(connection_token, link, apply, true, None)
     }
 
     fn handle_replication_transaction_frame(
@@ -1271,6 +1419,10 @@ impl ServerWorkerState {
         link: &mut ReplicaLink,
     ) -> Result<u64, ()> {
         let started = std::time::Instant::now();
+        self.ctx.replication_mut().record_upstream_transaction(
+            connection_token,
+            crate::engine::distributed::replication::UpstreamTransactionPhase::Executing,
+        );
         let previous_aof_db = self.ctx.persistence().aof_selected_db();
         let (queued, initial_db) = {
             let conn = &mut self.connection_registry
@@ -1325,12 +1477,19 @@ impl ServerWorkerState {
         // A downstream snapshot must never split an uncommitted transaction.
         // Publish its complete stream only after all queued commands have applied.
         let final_db = self.connection_registry[Token(connection_token)].selected_db;
+        if self.ctx.config().persistence.aof_enabled {
+            self.ctx.replication_mut().record_upstream_transaction(
+                connection_token,
+                crate::engine::distributed::replication::UpstreamTransactionPhase::AofPrefixWritten,
+            );
+        }
         self.relay_replication_transaction_frame(frame, initial_db, previous_aof_db, final_db);
         // Writable replica wakeups can generate local AOF writes of their own.
         // Keep those effects after the committed transaction that made the keys ready.
         // The wakeup loop pops keys from a stack, so preserve first-ready order.
         dirty_keys.reverse();
         self.signal_keys_ready(&dirty_keys);
+        self.process_ready_keys();
         Ok(duration_us)
     }
 
@@ -1341,7 +1500,7 @@ impl ServerWorkerState {
         previous_aof_db: i64,
         final_db: u32,
     ) {
-        self.propagate_replication_frame(&frame);
+        let relay_frame = frame.clone();
         if self.ctx.config().persistence.aof_enabled {
             let op = PropagationOp::new(initial_db, PropagationTargets::Aof, frame);
             let sequenced = sequence_propagation(&[op], self.ctx.repl_seldb(), previous_aof_db);
@@ -1350,6 +1509,7 @@ impl ServerWorkerState {
             }
             self.flush_aof_if_needed();
         }
+        self.propagate_replication_frame(&relay_frame);
         self.ctx.set_repl_seldb(i64::from(final_db));
         self.ctx
             .persistence_mut()
@@ -1389,17 +1549,19 @@ impl ServerWorkerState {
                 )
                 .map_err(|_| ())?;
                 let duration_us = (started.elapsed().as_micros() as u64).max(1);
-                if relay_stream {
-                    self.propagate_replication_frame(&frame);
-                }
                 if relay_stream && self.ctx.config().persistence.aof_enabled {
                     self.feed_aof(&frame);
                     self.flush_aof_if_needed();
                 }
+                if relay_stream {
+                    self.propagate_replication_frame(&frame);
+                }
                 self.ctx.set_repl_seldb(i64::from(db));
-                self.ctx
-                    .persistence_mut()
-                    .set_aof_selected_db(i64::from(db));
+                if relay_stream {
+                    self.ctx
+                        .persistence_mut()
+                        .set_aof_selected_db(i64::from(db));
+                }
                 duration_us
             }
             ReplicationApply::Ping => {
@@ -1424,6 +1586,11 @@ impl ServerWorkerState {
                 duration_us
             }
             ReplicationApply::Command(args) => {
+                if !self.ctx.config().persistence.aof_enabled
+                    && self.replicated_command_requires_durable_aof(&args)
+                {
+                    self.ctx.aof_mut().invalidate_replication_baseline();
+                }
                 let (duration_us, outcome) =
                     self.execute_replicated_command(connection_token, &args, relay_stream)?;
                 if let Some(outcome) = outcome {
@@ -1746,13 +1913,7 @@ impl ServerWorkerState {
                 }
             }
         }
-        match pending_wakeup {
-            Some(keys) => keys.extend(outcome.dirty_keys),
-            None => self.signal_keys_ready(&outcome.dirty_keys),
-        }
-        if relay_stream {
-            self.propagate_replication_frame(&outcome.frame);
-        }
+        let relay_frame = outcome.frame.clone();
         if relay_stream && self.ctx.config().persistence.aof_enabled {
             let op =
                 PropagationOp::new(outcome.selected_db, PropagationTargets::Aof, outcome.frame);
@@ -1769,14 +1930,21 @@ impl ServerWorkerState {
                 .set_aof_selected_db(sequenced.aof_selected_db);
             self.flush_aof_if_needed();
         }
+        if relay_stream {
+            self.propagate_replication_frame(&relay_frame);
+        }
+        match pending_wakeup {
+            Some(keys) => keys.extend(outcome.dirty_keys),
+            None => self.signal_keys_ready(&outcome.dirty_keys),
+        }
     }
 
     fn propagate_and_aof(&mut self, relay_stream: bool, frame: &[u8]) {
-        if relay_stream {
-            self.propagate_replication_frame(frame);
-        }
         if relay_stream && self.ctx.config().persistence.aof_enabled {
             self.feed_aof(frame);
+        }
+        if relay_stream {
+            self.propagate_replication_frame(frame);
         }
     }
 }

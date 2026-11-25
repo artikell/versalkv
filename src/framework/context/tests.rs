@@ -79,6 +79,48 @@ fn server_context_excludes_replication_and_slot_export_buffers() {
 }
 
 #[test]
+fn server_context_charges_unreleased_replication_to_maxmemory() {
+    let mut ctx = ServerContext::new(1);
+    ctx.config_mut().server.repl_backlog_size = 0;
+    ctx.replication_mut().backlog.set_capacity(8_192);
+    ctx.replication_mut()
+        .backlog
+        .set_replication_release_cursor(Some(
+            crate::engine::distributed::replication::BacklogCursor::ZERO,
+        ));
+    ctx.replication_mut()
+        .backlog
+        .append(&vec![b'x'; 4_096])
+        .unwrap();
+    let ordinary = ctx.maxmemory_state().not_counted;
+    ctx.config_mut().replication.repl_after_aof_fsync = true;
+    assert_eq!(ctx.maxmemory_state().not_counted, ordinary - 4_096);
+}
+
+#[test]
+fn ending_forkless_capture_keeps_expiration_paused_after_aof_failure() {
+    let mut ctx = ServerContext::new(1);
+    ctx.config_mut().persistence.aof_enabled = true;
+    ctx.config_mut().replication.repl_after_aof_fsync = true;
+    ctx.aof_mut().last_write_status = crate::engine::persistence::OperationStatus::Err;
+    ctx.db_mut(0).unwrap().set(
+        b"expired".to_vec(),
+        crate::foundation::io::store::Robj::string("value"),
+    );
+    ctx.db_mut(0).unwrap().set_expire(b"expired", 1);
+
+    ctx.set_forkless_capture_expiration_paused(true);
+    ctx.set_forkless_capture_expiration_paused(false);
+
+    assert!(ctx.db_mut(0).unwrap().get(b"expired").is_none());
+    assert_eq!(ctx.db(0).unwrap().dbsize(), 1);
+    ctx.config_mut().replication.repl_after_aof_fsync = false;
+    ctx.set_forkless_capture_expiration_paused(false);
+    assert!(ctx.db_mut(0).unwrap().get(b"expired").is_none());
+    assert_eq!(ctx.db(0).unwrap().dbsize(), 0);
+}
+
+#[test]
 fn server_context_excludes_active_aof_buffer_allocation() {
     let path = std::env::temp_dir().join(format!(
         "versal-maxmemory-aof-{}-{}.aof",
